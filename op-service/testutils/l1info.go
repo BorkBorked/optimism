@@ -10,21 +10,28 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+var _ eth.BlockInfo = &MockBlockInfo{}
+
 type MockBlockInfo struct {
 	// Prefixed all fields with "Info" to avoid collisions with the interface method names.
 
-	InfoHash        common.Hash
-	InfoParentHash  common.Hash
-	InfoCoinbase    common.Address
-	InfoRoot        common.Hash
-	InfoNum         uint64
-	InfoTime        uint64
-	InfoMixDigest   [32]byte
-	InfoBaseFee     *big.Int
-	InfoReceiptRoot common.Hash
-	InfoGasUsed     uint64
-	InfoGasLimit    uint64
-	InfoHeaderRLP   []byte
+	InfoHash          common.Hash
+	InfoParentHash    common.Hash
+	InfoCoinbase      common.Address
+	InfoRoot          common.Hash
+	InfoNum           uint64
+	InfoTime          uint64
+	InfoMixDigest     [32]byte
+	InfoBaseFee       *big.Int
+	InfoBlobBaseFee   *big.Int
+	InfoExcessBlobGas *uint64
+	InfoReceiptRoot   common.Hash
+	InfoGasUsed       uint64
+	InfoGasLimit      uint64
+	InfoHeaderRLP     []byte
+
+	InfoParentBeaconRoot *common.Hash
+	InfoWithdrawalsRoot  *common.Hash
 }
 
 func (l *MockBlockInfo) Hash() common.Hash {
@@ -59,6 +66,14 @@ func (l *MockBlockInfo) BaseFee() *big.Int {
 	return l.InfoBaseFee
 }
 
+func (l *MockBlockInfo) BlobBaseFee() *big.Int {
+	return l.InfoBlobBaseFee
+}
+
+func (l *MockBlockInfo) ExcessBlobGas() *uint64 {
+	return l.InfoExcessBlobGas
+}
+
 func (l *MockBlockInfo) ReceiptHash() common.Hash {
 	return l.InfoReceiptRoot
 }
@@ -73,6 +88,14 @@ func (l *MockBlockInfo) GasLimit() uint64 {
 
 func (l *MockBlockInfo) ID() eth.BlockID {
 	return eth.BlockID{Hash: l.InfoHash, Number: l.InfoNum}
+}
+
+func (l *MockBlockInfo) ParentBeaconRoot() *common.Hash {
+	return l.InfoParentBeaconRoot
+}
+
+func (l *MockBlockInfo) WithdrawalsRoot() *common.Hash {
+	return l.InfoWithdrawalsRoot
 }
 
 func (l *MockBlockInfo) HeaderRLP() ([]byte, error) {
@@ -98,6 +121,7 @@ func RandomBlockInfo(rng *rand.Rand) *MockBlockInfo {
 		InfoTime:        rng.Uint64(),
 		InfoHash:        RandomHash(rng),
 		InfoBaseFee:     big.NewInt(rng.Int63n(1000_000 * 1e9)), // a million GWEI
+		InfoBlobBaseFee: big.NewInt(rng.Int63n(2000_000 * 1e9)), // two million GWEI
 		InfoReceiptRoot: types.EmptyRootHash,
 		InfoRoot:        RandomHash(rng),
 		InfoGasUsed:     rng.Uint64(),

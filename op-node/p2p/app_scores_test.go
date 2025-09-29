@@ -63,7 +63,7 @@ func (a *appScoreTestData) WaitForNextScoreBookUpdate(t *testing.T) stubScoreBoo
 func setupPeerApplicationScorerTest(t *testing.T, params *ApplicationScoreParams) (*appScoreTestData, *peerApplicationScorer) {
 	data := &appScoreTestData{
 		ctx:    context.Background(),
-		logger: testlog.Logger(t, log.LvlInfo),
+		logger: testlog.Logger(t, log.LevelInfo),
 		clock:  clock.NewDeterministicClock(time.UnixMilli(1000)),
 		peers:  []peer.ID{},
 		scorebook: &stubScoreBook{
@@ -71,7 +71,7 @@ func setupPeerApplicationScorerTest(t *testing.T, params *ApplicationScoreParams
 			updates: make(chan stubScoreBookUpdate, 10),
 		},
 	}
-	appScorer := newPeerApplicationScorer(data.ctx, data.logger, data.clock, params, data.scorebook, func() []peer.ID {
+	appScorer := NewPeerApplicationScorer(data.ctx, data.logger, data.clock, params, data.scorebook, func() []peer.ID {
 		return data.peers
 	})
 	return data, appScorer
@@ -155,8 +155,8 @@ func TestDecayScoresAfterDecayInterval(t *testing.T) {
 		DecayToZero:          0.1,
 	}
 
-	appScorer.start()
-	defer appScorer.stop()
+	appScorer.Start()
+	defer appScorer.Stop()
 
 	data.clock.WaitForNewPendingTaskWithTimeout(30 * time.Second)
 

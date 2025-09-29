@@ -9,11 +9,13 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/ethereum-optimism/optimism/op-chain-ops/genesis"
+	oplog "github.com/ethereum-optimism/optimism/op-service/log"
 	"github.com/ethereum/go-ethereum/log"
 )
 
 func main() {
-	log.Root().SetHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(isatty.IsTerminal(os.Stderr.Fd()))))
+	color := isatty.IsTerminal(os.Stderr.Fd())
+	oplog.SetGlobalLogHandler(log.NewTerminalHandler(os.Stderr, color))
 
 	app := &cli.App{
 		Name:  "check-deploy-config",
@@ -44,8 +46,11 @@ func entrypoint(ctx *cli.Context) error {
 		return err
 	}
 
+	cfg := oplog.DefaultCLIConfig()
+	logger := oplog.NewLogger(ctx.App.Writer, cfg)
+
 	// Check the config, no need to call `CheckAddresses()`
-	if err := config.Check(); err != nil {
+	if err := config.Check(logger); err != nil {
 		return err
 	}
 

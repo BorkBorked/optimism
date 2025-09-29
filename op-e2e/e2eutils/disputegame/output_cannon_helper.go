@@ -2,72 +2,87 @@ package disputegame
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"path/filepath"
+	"testing"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/contracts"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/stretchr/testify/require"
+
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/outputs"
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/vm"
 	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/challenger"
-	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 type OutputCannonGameHelper struct {
 	OutputGameHelper
+	CannonHelper
 }
 
-func (g *OutputCannonGameHelper) StartChallenger(
-	ctx context.Context,
-	l2Node string,
-	name string,
-	options ...challenger.Option,
-) *challenger.Helper {
-	rollupEndpoint := g.system.RollupEndpoint(l2Node)
-	l2Endpoint := g.system.NodeEndpoint(l2Node)
-	opts := []challenger.Option{
-		challenger.WithOutputCannon(g.t, g.system.RollupCfg(), g.system.L2Genesis(), rollupEndpoint, l2Endpoint),
-		challenger.WithFactoryAddress(g.factoryAddr),
-		challenger.WithGameAddress(g.addr),
+func NewOutputCannonGameHelper(t *testing.T, client *ethclient.Client, opts *bind.TransactOpts, key *ecdsa.PrivateKey, game contracts.FaultDisputeGameContract, factoryAddr common.Address, gameAddr common.Address, provider *outputs.OutputTraceProvider, system DisputeSystem) *OutputCannonGameHelper {
+	outputGameHelper := NewOutputGameHelper(t, require.New(t), client, opts, key, game, factoryAddr, gameAddr, provider, system)
+	defaultChallengerOptions := func() []challenger.Option {
+		return []challenger.Option{
+			challenger.WithCannon(t, system),
+			challenger.WithFactoryAddress(factoryAddr),
+			challenger.WithGameAddress(gameAddr),
+		}
 	}
-	opts = append(opts, options...)
-	c := challenger.NewChallenger(g.t, ctx, g.system.NodeEndpoint("l1"), name, opts...)
-	g.t.Cleanup(func() {
-		_ = c.Close()
-	})
-	return c
+	return &OutputCannonGameHelper{
+		OutputGameHelper: *outputGameHelper,
+		CannonHelper:     *NewCannonHelper(&outputGameHelper.SplitGameHelper, defaultChallengerOptions),
+	}
 }
 
-func (g *OutputCannonGameHelper) CreateHonestActor(ctx context.Context, l2Node string, options ...challenger.Option) *OutputHonestHelper {
-	opts := []challenger.Option{
-		challenger.WithOutputCannon(g.t, g.system.RollupCfg(), g.system.L2Genesis(), g.system.RollupEndpoint(l2Node), g.system.NodeEndpoint(l2Node)),
-		challenger.WithFactoryAddress(g.factoryAddr),
-		challenger.WithGameAddress(g.addr),
+type HonestActorConfig struct {
+	PrestateSequenceNumber  uint64
+	PoststateSequenceNumber uint64
+	ChallengerOpts          []challenger.Option
+}
+
+type HonestActorOpt func(cfg *HonestActorConfig)
+
+func WithClaimedL2BlockNumber(num uint64) HonestActorOpt {
+	return func(cfg *HonestActorConfig) {
+		cfg.PoststateSequenceNumber = num
 	}
-	opts = append(opts, options...)
-	cfg := challenger.NewChallengerConfig(g.t, g.system.NodeEndpoint("l1"), opts...)
+}
 
-	logger := testlog.Logger(g.t, log.LvlInfo).New("role", "HonestHelper", "game", g.addr)
-	l2Client := g.system.NodeClient(l2Node)
-	caller := batching.NewMultiCaller(g.system.NodeClient("l1").Client(), batching.DefaultBatchSize)
-	contract, err := contracts.NewOutputBisectionGameContract(g.addr, caller)
-	g.require.NoError(err, "Failed to create game contact")
+func WithPrivKey(privKey *ecdsa.PrivateKey) HonestActorOpt {
+	return func(cfg *HonestActorConfig) {
+		cfg.ChallengerOpts = append(cfg.ChallengerOpts, challenger.WithPrivKey(privKey))
+	}
+}
 
-	prestateBlock, poststateBlock, err := contract.GetBlockRange(ctx)
-	g.require.NoError(err, "Failed to load block range")
+func (g *OutputCannonGameHelper) CreateHonestActor(ctx context.Context, l2Node string, options ...HonestActorOpt) *OutputHonestHelper {
+	logger := testlog.Logger(g.T, log.LevelInfo).New("role", "HonestHelper", "game", g.Addr)
+	l2Client := g.System.NodeClient(l2Node)
+
+	realPrestateBlock, realPostStateBlock, err := g.Game.GetGameRange(ctx)
+	g.Require.NoError(err, "Failed to load block range")
+	splitDepth := g.SplitDepth(ctx)
+	rollupClient := g.System.RollupClient(l2Node)
+	actorCfg := &HonestActorConfig{
+		PrestateSequenceNumber:  realPrestateBlock,
+		PoststateSequenceNumber: realPostStateBlock,
+		ChallengerOpts:          g.defaultChallengerOptions(),
+	}
+	for _, option := range options {
+		option(actorCfg)
+	}
+
+	cfg := challenger.NewChallengerConfig(g.T, g.System, l2Node, actorCfg.ChallengerOpts...)
 	dir := filepath.Join(cfg.Datadir, "honest")
-	maxDepth := uint64(g.MaxDepth(ctx))
-	splitDepth := uint64(g.SplitDepth(ctx))
-	rollupClient := g.system.RollupClient(l2Node)
-	prestateProvider := outputs.NewPrestateProvider(ctx, logger, rollupClient, prestateBlock)
+	prestateProvider := outputs.NewPrestateProvider(rollupClient, actorCfg.PrestateSequenceNumber)
+	l1Head := g.GetL1Head(ctx)
 	accessor, err := outputs.NewOutputCannonTraceAccessor(
-		ctx, logger, metrics.NoopMetrics, cfg, l2Client, contract, prestateProvider, rollupClient, dir, maxDepth, splitDepth, prestateBlock, poststateBlock)
-	g.require.NoError(err, "Failed to create output cannon trace accessor")
-	return &OutputHonestHelper{
-		t:            g.t,
-		require:      g.require,
-		game:         &g.OutputGameHelper,
-		contract:     contract,
-		correctTrace: accessor,
-	}
+		logger, metrics.NoopMetrics, cfg.Cannon, vm.NewOpProgramServerExecutor(logger), l2Client, prestateProvider, cfg.CannonAbsolutePreState, rollupClient, dir, l1Head, splitDepth, actorCfg.PrestateSequenceNumber, actorCfg.PoststateSequenceNumber)
+	g.Require.NoError(err, "Failed to create output cannon trace accessor")
+	return NewOutputHonestHelper(g.T, g.Require, &g.OutputGameHelper.SplitGameHelper, g.Game, accessor)
 }

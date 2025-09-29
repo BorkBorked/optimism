@@ -5,199 +5,135 @@ import (
 	"fmt"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/config"
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/claims"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/contracts"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/alphabet"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/cannon"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/outputs"
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/vm"
 	faultTypes "github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
+	keccakTypes "github.com/ethereum-optimism/optimism/op-challenger/game/keccak/types"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/scheduler"
-	"github.com/ethereum-optimism/optimism/op-challenger/game/types"
 	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
-	"github.com/ethereum-optimism/optimism/op-service/dial"
+	"github.com/ethereum-optimism/optimism/op-service/clock"
 	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
-	"github.com/ethereum-optimism/optimism/op-service/txmgr"
-	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-)
-
-var (
-	cannonGameType         = uint8(0)
-	outputCannonGameType   = uint8(1)
-	outputAlphabetGameType = uint8(254)
-	alphabetGameType       = uint8(255)
 )
 
 type CloseFunc func()
 
 type Registry interface {
-	RegisterGameType(gameType uint8, creator scheduler.PlayerCreator)
+	RegisterGameType(gameType faultTypes.GameType, creator scheduler.PlayerCreator)
+	RegisterBondContract(gameType faultTypes.GameType, creator claims.BondContractCreator)
+}
+
+type OracleRegistry interface {
+	RegisterOracle(oracle keccakTypes.LargePreimageOracle)
+}
+
+type PrestateSource interface {
+	// PrestatePath returns the path to the prestate file to use for the game.
+	// The provided prestateHash may be used to differentiate between different states but no guarantee is made that
+	// the returned prestate matches the supplied hash.
+	PrestatePath(ctx context.Context, prestateHash common.Hash) (string, error)
+}
+
+type RollupClient interface {
+	outputs.OutputRollupClient
+	SyncStatusProvider
 }
 
 func RegisterGameTypes(
-	registry Registry,
 	ctx context.Context,
+	systemClock clock.Clock,
+	l1Clock faultTypes.ClockReader,
 	logger log.Logger,
 	m metrics.Metricer,
 	cfg *config.Config,
-	txMgr txmgr.TxManager,
+	registry Registry,
+	oracles OracleRegistry,
+	txSender TxSender,
+	gameFactory *contracts.DisputeGameFactoryContract,
 	caller *batching.MultiCaller,
+	l1HeaderSource L1HeaderSource,
+	selective bool,
+	claimants []common.Address,
 ) (CloseFunc, error) {
-	var closer CloseFunc
-	var l2Client *ethclient.Client
-	if cfg.TraceTypeEnabled(config.TraceTypeCannon) || cfg.TraceTypeEnabled(config.TraceTypeOutputCannon) {
-		l2, err := ethclient.DialContext(ctx, cfg.CannonL2)
-		if err != nil {
-			return nil, fmt.Errorf("dial l2 client %v: %w", cfg.CannonL2, err)
-		}
-		l2Client = l2
-		closer = l2Client.Close
-	}
-	if cfg.TraceTypeEnabled(config.TraceTypeOutputCannon) {
-		registerOutputCannon(registry, ctx, logger, m, cfg, txMgr, caller, l2Client)
-	}
-	if cfg.TraceTypeEnabled(config.TraceTypeOutputAlphabet) {
-		registerOutputAlphabet(registry, ctx, logger, m, cfg, txMgr, caller)
-	}
-	if cfg.TraceTypeEnabled(config.TraceTypeCannon) {
-		registerCannon(registry, ctx, logger, m, cfg, txMgr, caller, l2Client)
-	}
-	if cfg.TraceTypeEnabled(config.TraceTypeAlphabet) {
-		registerAlphabet(registry, ctx, logger, m, cfg, txMgr, caller)
-	}
-	return closer, nil
-}
-
-func registerOutputAlphabet(
-	registry Registry,
-	ctx context.Context,
-	logger log.Logger,
-	m metrics.Metricer,
-	cfg *config.Config,
-	txMgr txmgr.TxManager,
-	caller *batching.MultiCaller) {
-	playerCreator := func(game types.GameMetadata, dir string) (scheduler.GamePlayer, error) {
-		contract, err := contracts.NewOutputBisectionGameContract(game.Proxy, caller)
+	clients := &clientProvider{ctx: ctx, logger: logger, cfg: cfg}
+	var registerTasks []*RegisterTask
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeCannon) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
 		if err != nil {
 			return nil, err
 		}
-		prestateBlock, poststateBlock, err := contract.GetBlockRange(ctx)
-		if err != nil {
-			return nil, err
-		}
-		rollupClient, err := dial.DialRollupClientWithTimeout(ctx, dial.DefaultDialTimeout, logger, cfg.RollupRpc)
-		if err != nil {
-			return nil, err
-		}
-		prestateProvider := outputs.NewPrestateProvider(ctx, logger, rollupClient, prestateBlock)
-		creator := func(ctx context.Context, logger log.Logger, gameDepth uint64, dir string) (faultTypes.TraceAccessor, error) {
-			splitDepth, err := contract.GetSplitDepth(ctx)
-			if err != nil {
-				return nil, err
-			}
-			accessor, err := outputs.NewOutputAlphabetTraceAccessor(ctx, logger, m, cfg, prestateProvider, rollupClient, gameDepth, splitDepth, prestateBlock, poststateBlock)
-			if err != nil {
-				return nil, err
-			}
-			return accessor, nil
-		}
-		prestateValidator := NewPrestateValidator(contract.GetAbsolutePrestateHash, prestateProvider)
-		genesisValidator := NewPrestateValidator(contract.GetGenesisOutputRoot, prestateProvider)
-		return NewGamePlayer(ctx, logger, m, dir, game.Proxy, txMgr, contract, []Validator{prestateValidator, genesisValidator}, creator)
+		registerTasks = append(registerTasks, NewCannonRegisterTask(faultTypes.CannonGameType, cfg, m, vm.NewOpProgramServerExecutor(logger), l2HeaderSource, rollupClient, syncValidator))
 	}
-	registry.RegisterGameType(outputAlphabetGameType, playerCreator)
-}
-
-func registerOutputCannon(
-	registry Registry,
-	ctx context.Context,
-	logger log.Logger,
-	m metrics.Metricer,
-	cfg *config.Config,
-	txMgr txmgr.TxManager,
-	caller *batching.MultiCaller,
-	l2Client cannon.L2HeaderSource) {
-	playerCreator := func(game types.GameMetadata, dir string) (scheduler.GamePlayer, error) {
-		contract, err := contracts.NewOutputBisectionGameContract(game.Proxy, caller)
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeCannonKona) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
 		if err != nil {
 			return nil, err
 		}
-		prestateBlock, poststateBlock, err := contract.GetBlockRange(ctx)
-		if err != nil {
-			return nil, err
-		}
-		rollupClient, err := dial.DialRollupClientWithTimeout(ctx, dial.DefaultDialTimeout, logger, cfg.RollupRpc)
-		if err != nil {
-			return nil, err
-		}
-		prestateProvider := outputs.NewPrestateProvider(ctx, logger, rollupClient, prestateBlock)
-		creator := func(ctx context.Context, logger log.Logger, gameDepth uint64, dir string) (faultTypes.TraceAccessor, error) {
-			splitDepth, err := contract.GetSplitDepth(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load split depth: %w", err)
-			}
-			accessor, err := outputs.NewOutputCannonTraceAccessor(ctx, logger, m, cfg, l2Client, contract, prestateProvider, rollupClient, dir, gameDepth, splitDepth, prestateBlock, poststateBlock)
-			if err != nil {
-				return nil, err
-			}
-			return accessor, nil
-		}
-		prestateValidator := NewPrestateValidator(contract.GetAbsolutePrestateHash, prestateProvider)
-		genesisValidator := NewPrestateValidator(contract.GetGenesisOutputRoot, prestateProvider)
-		return NewGamePlayer(ctx, logger, m, dir, game.Proxy, txMgr, contract, []Validator{prestateValidator, genesisValidator}, creator)
+		registerTasks = append(registerTasks, NewCannonKonaRegisterTask(faultTypes.CannonKonaGameType, cfg, m, vm.NewKonaExecutor(), l2HeaderSource, rollupClient, syncValidator))
 	}
-	registry.RegisterGameType(outputCannonGameType, playerCreator)
-}
-
-func registerCannon(
-	registry Registry,
-	ctx context.Context,
-	logger log.Logger,
-	m metrics.Metricer,
-	cfg *config.Config,
-	txMgr txmgr.TxManager,
-	caller *batching.MultiCaller,
-	l2Client cannon.L2HeaderSource) {
-	playerCreator := func(game types.GameMetadata, dir string) (scheduler.GamePlayer, error) {
-		contract, err := contracts.NewFaultDisputeGameContract(game.Proxy, caller)
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeSuperCannon) {
+		rootProvider, syncValidator, err := clients.SuperchainClients()
 		if err != nil {
 			return nil, err
 		}
-		prestateProvider := cannon.NewPrestateProvider(cfg)
-		creator := func(ctx context.Context, logger log.Logger, gameDepth uint64, dir string) (faultTypes.TraceAccessor, error) {
-			localInputs, err := cannon.FetchLocalInputs(ctx, contract, l2Client)
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch cannon local inputs: %w", err)
-			}
-			provider := cannon.NewTraceProvider(logger, m, cfg, faultTypes.NoLocalContext, localInputs, dir, gameDepth)
-			return trace.NewSimpleTraceAccessor(provider), nil
-		}
-		validator := NewPrestateValidator(contract.GetAbsolutePrestateHash, prestateProvider)
-		return NewGamePlayer(ctx, logger, m, dir, game.Proxy, txMgr, contract, []Validator{validator}, creator)
+		registerTasks = append(registerTasks, NewSuperCannonRegisterTask(faultTypes.SuperCannonGameType, cfg, m, vm.NewOpProgramServerExecutor(logger), rootProvider, syncValidator))
 	}
-	registry.RegisterGameType(cannonGameType, playerCreator)
-}
-
-func registerAlphabet(
-	registry Registry,
-	ctx context.Context,
-	logger log.Logger,
-	m metrics.Metricer,
-	cfg *config.Config,
-	txMgr txmgr.TxManager,
-	caller *batching.MultiCaller) {
-	playerCreator := func(game types.GameMetadata, dir string) (scheduler.GamePlayer, error) {
-		contract, err := contracts.NewFaultDisputeGameContract(game.Proxy, caller)
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypePermissioned) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
 		if err != nil {
 			return nil, err
 		}
-		prestateProvider := &alphabet.AlphabetPrestateProvider{}
-		creator := func(ctx context.Context, logger log.Logger, gameDepth uint64, dir string) (faultTypes.TraceAccessor, error) {
-			traceProvider := alphabet.NewTraceProvider(cfg.AlphabetTrace, gameDepth)
-			return trace.NewSimpleTraceAccessor(traceProvider), nil
-		}
-		validator := NewPrestateValidator(contract.GetAbsolutePrestateHash, prestateProvider)
-		return NewGamePlayer(ctx, logger, m, dir, game.Proxy, txMgr, contract, []Validator{validator}, creator)
+		registerTasks = append(registerTasks, NewCannonRegisterTask(faultTypes.PermissionedGameType, cfg, m, vm.NewOpProgramServerExecutor(logger), l2HeaderSource, rollupClient, syncValidator))
 	}
-	registry.RegisterGameType(alphabetGameType, playerCreator)
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeSuperPermissioned) {
+		rootProvider, syncValidator, err := clients.SuperchainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewSuperCannonRegisterTask(faultTypes.SuperPermissionedGameType, cfg, m, vm.NewOpProgramServerExecutor(logger), rootProvider, syncValidator))
+	}
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeAsterisc) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewAsteriscRegisterTask(faultTypes.AsteriscGameType, cfg, m, vm.NewOpProgramServerExecutor(logger), l2HeaderSource, rollupClient, syncValidator))
+	}
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeAsteriscKona) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewAsteriscKonaRegisterTask(faultTypes.AsteriscKonaGameType, cfg, m, vm.NewKonaExecutor(), l2HeaderSource, rollupClient, syncValidator))
+	}
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeSuperAsteriscKona) {
+		rootProvider, syncValidator, err := clients.SuperchainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewSuperAsteriscKonaRegisterTask(faultTypes.SuperAsteriscKonaGameType, cfg, m, vm.NewKonaSuperExecutor(), rootProvider, syncValidator))
+	}
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeFast) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewAlphabetRegisterTask(faultTypes.FastGameType, l2HeaderSource, rollupClient, syncValidator))
+	}
+	if cfg.TraceTypeEnabled(faultTypes.TraceTypeAlphabet) {
+		l2HeaderSource, rollupClient, syncValidator, err := clients.SingleChainClients()
+		if err != nil {
+			return nil, err
+		}
+		registerTasks = append(registerTasks, NewAlphabetRegisterTask(faultTypes.AlphabetGameType, l2HeaderSource, rollupClient, syncValidator))
+	}
+	for _, task := range registerTasks {
+		if err := task.Register(ctx, registry, oracles, systemClock, l1Clock, logger, m, txSender, gameFactory, caller, l1HeaderSource, selective, claimants, cfg.ResponseDelay, cfg.ResponseDelayAfter); err != nil {
+			return clients.Close, fmt.Errorf("failed to register %v game type: %w", task.gameType, err)
+		}
+	}
+	return clients.Close, nil
 }

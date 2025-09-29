@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
+// Libraries
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeCall } from "src/libraries/SafeCall.sol";
 import { Hashing } from "src/libraries/Hashing.sol";
 import { Encoding } from "src/libraries/Encoding.sol";
@@ -114,8 +116,18 @@ abstract contract CrossDomainMessenger is
     ///         call in `relayMessage`.
     uint64 public constant RELAY_GAS_CHECK_BUFFER = 5_000;
 
-    /// @notice Address of the paired CrossDomainMessenger contract on the other chain.
-    address public immutable OTHER_MESSENGER;
+    /// @notice Base gas required for any transaction in the EVM.
+    uint64 public constant TX_BASE_GAS = 21_000;
+
+    /// @notice Floor overhead per byte of non-zero calldata in a message. Calldata floor was
+    ///         introduced in EIP-7623.
+    uint64 public constant FLOOR_CALLDATA_OVERHEAD = 40;
+
+    /// @notice Overhead added to the internal message data when the full call to relayMessage is
+    ///         ABI encoded. This is a constant value that is specific to the V1 message encoding
+    ///         scheme. 260 is an upper bound, actual overhead can be as low as 228 bytes for an
+    ///         empty message.
+    uint64 public constant ENCODING_OVERHEAD = 260;
 
     /// @notice Mapping of message hashes to boolean receipt values. Note that a message will only
     ///         be present in this mapping if it has successfully been relayed on this chain, and
@@ -138,10 +150,14 @@ abstract contract CrossDomainMessenger is
     ///         successfully executed on the first attempt.
     mapping(bytes32 => bool) public failedMessages;
 
+    /// @notice CrossDomainMessenger contract on the other chain.
+    /// @custom:network-specific
+    CrossDomainMessenger public otherMessenger;
+
     /// @notice Reserve extra slots in the storage layout for future upgrades.
-    ///         A gap size of 44 was chosen here, so that the first slot used in a child contract
+    ///         A gap size of 43 was chosen here, so that the first slot used in a child contract
     ///         would be 1 plus a multiple of 50.
-    uint256[44] private __gap;
+    uint256[43] private __gap;
 
     /// @notice Emitted whenever a message is sent to the other chain.
     /// @param target       Address of the recipient of the message.
@@ -165,11 +181,6 @@ abstract contract CrossDomainMessenger is
     /// @param msgHash Hash of the message that failed to be relayed.
     event FailedRelayedMessage(bytes32 indexed msgHash);
 
-    /// @param _otherMessenger Address of the messenger on the paired chain.
-    constructor(address _otherMessenger) {
-        OTHER_MESSENGER = _otherMessenger;
-    }
-
     /// @notice Sends a message to some target address on the other chain. Note that if the call
     ///         always reverts, then the message will be unrelayable, and any ETH sent will be
     ///         permanently locked. The same will occur if the target on the other chain is
@@ -182,14 +193,14 @@ abstract contract CrossDomainMessenger is
         // message is the amount of gas requested by the user PLUS the base gas value. We want to
         // guarantee the property that the call to the target contract will always have at least
         // the minimum gas limit specified by the user.
-        _sendMessage(
-            OTHER_MESSENGER,
-            baseGas(_message, _minGasLimit),
-            msg.value,
-            abi.encodeWithSelector(
+        _sendMessage({
+            _to: address(otherMessenger),
+            _gasLimit: baseGas(_message, _minGasLimit),
+            _value: msg.value,
+            _data: abi.encodeWithSelector(
                 this.relayMessage.selector, messageNonce(), msg.sender, _target, msg.value, _minGasLimit, _message
             )
-        );
+        });
 
         emit SentMessage(_target, msg.sender, _message, messageNonce(), _minGasLimit);
         emit SentMessageExtension1(msg.sender, msg.value);
@@ -288,6 +299,9 @@ abstract contract CrossDomainMessenger is
         xDomainMsgSender = Constants.DEFAULT_L2_SENDER;
 
         if (success) {
+            // This check is identical to one above, but it ensures that the same message cannot be relayed
+            // twice, and adds a layer of protection against rentrancy.
+            assert(successfulMessages[versionedHash] == false);
             successfulMessages[versionedHash] = true;
             emit RelayedMessage(versionedHash);
         } else {
@@ -317,6 +331,14 @@ abstract contract CrossDomainMessenger is
         return xDomainMsgSender;
     }
 
+    /// @notice Retrieves the address of the paired CrossDomainMessenger contract on the other chain
+    ///         Public getter is legacy and will be removed in the future. Use `otherMessenger()` instead.
+    /// @return CrossDomainMessenger contract on the other chain.
+    /// @custom:legacy
+    function OTHER_MESSENGER() public view returns (CrossDomainMessenger) {
+        return otherMessenger;
+    }
+
     /// @notice Retrieves the next message nonce. Message version will be added to the upper two
     ///         bytes of the message nonce. Message version allows us to treat messages as having
     ///         different structures.
@@ -332,29 +354,58 @@ abstract contract CrossDomainMessenger is
     /// @param _message     Message to compute the amount of required gas for.
     /// @param _minGasLimit Minimum desired gas limit when message goes to target.
     /// @return Amount of gas required to guarantee message receipt.
-    function baseGas(bytes calldata _message, uint32 _minGasLimit) public pure returns (uint64) {
-        return
-        // Constant overhead
-        RELAY_CONSTANT_OVERHEAD
-        // Calldata overhead
-        + (uint64(_message.length) * MIN_GAS_CALLDATA_OVERHEAD)
-        // Dynamic overhead (EIP-150)
-        + ((_minGasLimit * MIN_GAS_DYNAMIC_OVERHEAD_NUMERATOR) / MIN_GAS_DYNAMIC_OVERHEAD_DENOMINATOR)
-        // Gas reserved for the worst-case cost of 3/5 of the `CALL` opcode's dynamic gas
-        // factors. (Conservative)
-        + RELAY_CALL_OVERHEAD
-        // Relay reserved gas (to ensure execution of `relayMessage` completes after the
-        // subcontext finishes executing) (Conservative)
-        + RELAY_RESERVED_GAS
-        // Gas reserved for the execution between the `hasMinGas` check and the `CALL`
-        // opcode. (Conservative)
-        + RELAY_GAS_CHECK_BUFFER;
+    function baseGas(bytes memory _message, uint32 _minGasLimit) public pure returns (uint64) {
+        // Base gas should really be computed on the fully encoded message but that would break the
+        // expected API, so we instead just add the encoding overhead to the message length inside
+        // of this function.
+
+        // We need a minimum amount of execution gas to ensure that the message will be received on
+        // the other side without running out of gas (stored within the failedMessages mapping).
+        // If we get beyond the hasMinGas check, then we *must* supply more than minGasLimit to
+        // the external call.
+        uint64 executionGas = uint64(
+            // Constant costs for relayMessage
+            RELAY_CONSTANT_OVERHEAD
+            // Covers dynamic parts of the CALL opcode
+            + RELAY_CALL_OVERHEAD
+            // Ensures execution of relayMessage completes after call
+            + RELAY_RESERVED_GAS
+            // Buffer between hasMinGas check and the CALL
+            + RELAY_GAS_CHECK_BUFFER
+            // Minimum gas limit, multiplied by 64/63 to account for EIP-150.
+            + ((_minGasLimit * MIN_GAS_DYNAMIC_OVERHEAD_NUMERATOR) / MIN_GAS_DYNAMIC_OVERHEAD_DENOMINATOR)
+        );
+
+        // Total message size is the result of properly ABI encoding the call to relayMessage.
+        // Since we only get the message data and not the rest of the calldata, we use the
+        // ENCODING_OVERHEAD constant to conservatively account for the remaining bytes.
+        uint64 totalMessageSize = uint64(_message.length + ENCODING_OVERHEAD);
+
+        // Finally, replicate the transaction cost formula as defined after EIP-7623. This is
+        // mostly relevant in the L1 -> L2 case because we need to be able to cover the intrinsic
+        // cost of the message but it doesn't hurt in the L2 -> L1 case. After EIP-7623, the cost
+        // of a transaction is floored by its calldata size. We don't need to account for the
+        // contract creation case because this is always a call to relayMessage.
+        return TX_BASE_GAS
+            + uint64(
+                Math.max(
+                    executionGas + (totalMessageSize * MIN_GAS_CALLDATA_OVERHEAD),
+                    (totalMessageSize * FLOOR_CALLDATA_OVERHEAD)
+                )
+            );
     }
 
     /// @notice Initializer.
-    // solhint-disable-next-line func-name-mixedcase
-    function __CrossDomainMessenger_init() internal onlyInitializing {
-        xDomainMsgSender = Constants.DEFAULT_L2_SENDER;
+    /// @param _otherMessenger CrossDomainMessenger contract on the other chain.
+    function __CrossDomainMessenger_init(CrossDomainMessenger _otherMessenger) internal onlyInitializing {
+        // We only want to set the xDomainMsgSender to the default value if it hasn't been initialized yet,
+        // meaning that this is a fresh contract deployment.
+        // This prevents resetting the xDomainMsgSender to the default value during an upgrade, which would enable
+        // a reentrant withdrawal to sandwhich the upgrade replay a withdrawal twice.
+        if (xDomainMsgSender == address(0)) {
+            xDomainMsgSender = Constants.DEFAULT_L2_SENDER;
+        }
+        otherMessenger = _otherMessenger;
     }
 
     /// @notice Sends a low-level message to the other messenger. Needs to be implemented by child

@@ -102,13 +102,13 @@ type ScoreDiff interface {
 	Apply(score *scoreRecord)
 }
 
-var UnknownBanErr = errors.New("unknown ban")
+var ErrUnknownBan = errors.New("unknown ban")
 
 type PeerBanStore interface {
 	// SetPeerBanExpiration create the peer ban with expiration time.
 	// If expiry == time.Time{} then the ban is deleted.
 	SetPeerBanExpiration(id peer.ID, expiry time.Time) error
-	// GetPeerBanExpiration gets the peer ban expiration time, or UnknownBanErr error if none exists.
+	// GetPeerBanExpiration gets the peer ban expiration time, or ErrUnknownBan error if none exists.
 	GetPeerBanExpiration(id peer.ID) (time.Time, error)
 }
 
@@ -116,8 +116,15 @@ type IPBanStore interface {
 	// SetIPBanExpiration create the IP ban with expiration time.
 	// If expiry == time.Time{} then the ban is deleted.
 	SetIPBanExpiration(ip net.IP, expiry time.Time) error
-	// GetIPBanExpiration gets the IP ban expiration time, or UnknownBanErr error if none exists.
+	// GetIPBanExpiration gets the IP ban expiration time, or ErrUnknownBan error if none exists.
 	GetIPBanExpiration(ip net.IP) (time.Time, error)
+}
+
+type MetadataStore interface {
+	// SetPeerMetadata sets the metadata for the specified peer
+	SetPeerMetadata(id peer.ID, md PeerMetadata) (PeerMetadata, error)
+	// GetPeerMetadata returns the metadata for the specified peer
+	GetPeerMetadata(id peer.ID) (PeerMetadata, error)
 }
 
 // ExtendedPeerstore defines a type-safe API to work with additional peer metadata based on a libp2p peerstore.Peerstore
@@ -127,4 +134,5 @@ type ExtendedPeerstore interface {
 	peerstore.CertifiedAddrBook
 	PeerBanStore
 	IPBanStore
+	MetadataStore
 }

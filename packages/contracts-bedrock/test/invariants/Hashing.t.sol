@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
-import { Test } from "forge-std/Test.sol";
 import { StdInvariant } from "forge-std/StdInvariant.sol";
 import { Encoding } from "src/libraries/Encoding.sol";
 import { Hashing } from "src/libraries/Hashing.sol";
+import { InvariantTest } from "test/invariants/InvariantTest.sol";
 
 contract Hash_CrossDomainHasher {
     bool public failedCrossDomainHashHighVersion;
@@ -93,10 +93,11 @@ contract Hash_CrossDomainHasher {
     }
 }
 
-contract Hashing_Invariant is StdInvariant, Test {
+contract Hashing_Invariant is StdInvariant, InvariantTest {
     Hash_CrossDomainHasher internal actor;
 
-    function setUp() public {
+    function setUp() public override {
+        super.setUp();
         // Create a hasher actor.
         actor = new Hash_CrossDomainHasher();
 
@@ -114,7 +115,7 @@ contract Hashing_Invariant is StdInvariant, Test {
     ///
     ///                   The `hashCrossDomainMessage` function should always revert if
     ///                   the `version` passed is > `1`.
-    function invariant_hash_xdomain_msg_high_version() external {
+    function invariant_hash_xdomain_msg_high_version() external view {
         // ASSERTION: The round trip aliasing done in testRoundTrip(...) should never fail.
         assertFalse(actor.failedCrossDomainHashHighVersion());
     }
@@ -124,7 +125,7 @@ contract Hashing_Invariant is StdInvariant, Test {
     ///
     ///                   If the version passed is 0, `hashCrossDomainMessage` and
     ///                   `hashCrossDomainMessageV0` should be equivalent.
-    function invariant_hash_xdomain_msg_0() external {
+    function invariant_hash_xdomain_msg_0() external view {
         // ASSERTION: A call to hashCrossDomainMessage and hashCrossDomainMessageV0
         // should always match when the version passed is 0
         assertFalse(actor.failedCrossDomainHashV0());
@@ -135,7 +136,7 @@ contract Hashing_Invariant is StdInvariant, Test {
     ///
     ///                   If the version passed is 1, `hashCrossDomainMessage` and
     ///                   `hashCrossDomainMessageV1` should be equivalent.
-    function invariant_hash_xdomain_msg_1() external {
+    function invariant_hash_xdomain_msg_1() external view {
         // ASSERTION: A call to hashCrossDomainMessage and hashCrossDomainMessageV1
         // should always match when the version passed is 1
         assertFalse(actor.failedCrossDomainHashV1());

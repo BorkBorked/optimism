@@ -2,11 +2,11 @@
 pragma solidity 0.8.15;
 
 import { StdUtils } from "forge-std/StdUtils.sol";
-import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 import { StdInvariant } from "forge-std/StdInvariant.sol";
 import { Burn } from "src/libraries/Burn.sol";
+import { InvariantTest } from "test/invariants/InvariantTest.sol";
 
 contract Burn_EthBurner is StdUtils {
     Vm internal vm;
@@ -32,7 +32,7 @@ contract Burn_EthBurner is StdUtils {
         // execute a burn of _value eth
         Burn.eth(value);
 
-        // check that exactly value eth was transfered from the contract
+        // check that exactly value eth was transferred from the contract
         unchecked {
             if (address(this).balance != preBurnBalance - value) {
                 failedEthBurn = true;
@@ -41,10 +41,11 @@ contract Burn_EthBurner is StdUtils {
     }
 }
 
-contract Burn_BurnEth_Invariant is StdInvariant, Test {
+contract Burn_BurnEth_Invariant is StdInvariant, InvariantTest {
     Burn_EthBurner internal actor;
 
-    function setUp() public {
+    function setUp() public override {
+        super.setUp();
         // Create a Eth burner actor.
 
         actor = new Burn_EthBurner(vm);
@@ -61,7 +62,7 @@ contract Burn_BurnEth_Invariant is StdInvariant, Test {
     ///
     ///                   Asserts that when `Burn.eth(uint256)` is called, it always
     ///                   burns the exact amount of ETH passed to the function.
-    function invariant_burn_eth() external {
+    function invariant_burn_eth() external view {
         // ASSERTION: The amount burned should always match the amount passed exactly
         assertEq(actor.failedEthBurn(), false);
     }

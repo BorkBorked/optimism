@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ethereum-optimism/optimism/op-node/p2p/gating"
+	"github.com/ethereum-optimism/optimism/op-service/apis"
 
 	decredSecp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum-optimism/optimism/op-node/p2p/store"
@@ -24,8 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-
-	"github.com/ethereum-optimism/optimism/op-node/metrics"
 )
 
 // TODO: dynamic peering
@@ -36,6 +35,7 @@ var (
 	ErrDisabledDiscovery   = errors.New("discovery disabled")
 	ErrNoConnectionManager = errors.New("no connection manager")
 	ErrNoConnectionGater   = errors.New("no connection gater")
+	ErrInvalidRequest      = errors.New("invalid request")
 )
 
 type Node interface {
@@ -58,26 +58,18 @@ type Node interface {
 type APIBackend struct {
 	node Node
 	log  log.Logger
-	m    metrics.Metricer
 }
 
-var _ API = (*APIBackend)(nil)
+var _ apis.P2PClient = (*APIBackend)(nil)
 
-func NewP2PAPIBackend(node Node, log log.Logger, m metrics.Metricer) *APIBackend {
-	if m == nil {
-		m = metrics.NoopMetrics
-	}
-
+func NewP2PAPIBackend(node Node, log log.Logger) *APIBackend {
 	return &APIBackend{
 		node: node,
 		log:  log,
-		m:    m,
 	}
 }
 
-func (s *APIBackend) Self(ctx context.Context) (*PeerInfo, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_self")
-	defer recordDur()
+func (s *APIBackend) Self(ctx context.Context) (*apis.PeerInfo, error) {
 	h := s.node.Host()
 	nw := h.Network()
 	pstore := h.Peerstore()
@@ -93,8 +85,8 @@ func (s *APIBackend) Self(ctx context.Context) (*PeerInfo, error) {
 	return info, nil
 }
 
-func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMgr connmgr.ConnManager) (*PeerInfo, error) {
-	info := &PeerInfo{
+func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMgr connmgr.ConnManager) (*apis.PeerInfo, error) {
+	info := &apis.PeerInfo{
 		PeerID: id,
 	}
 
@@ -115,6 +107,10 @@ func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMg
 		if dat, err := eps.GetPeerScores(id); err == nil {
 			info.PeerScores = dat
 		}
+		if md, err := eps.GetPeerMetadata(id); err == nil {
+			info.ENR = md.ENR
+			info.ChainID = md.OPStackID
+		}
 	}
 	if dat, err := pstore.Get(id, "ProtocolVersion"); err == nil {
 		protocolVersion, ok := dat.(string)
@@ -126,12 +122,6 @@ func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMg
 		agentVersion, ok := dat.(string)
 		if ok {
 			info.UserAgent = agentVersion
-		}
-	}
-	if dat, err := pstore.Get(id, "ENR"); err == nil {
-		enodeData, ok := dat.(*enode.Node)
-		if ok {
-			info.ENR = enodeData.String()
 		}
 	}
 	// include the /p2p/ address component in all of the addresses for convenience of the API user.
@@ -152,12 +142,6 @@ func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMg
 		info.Direction = c.Stat().Direction
 		break
 	}
-	if dat, err := pstore.Get(id, "optimismChainID"); err == nil {
-		chID, ok := dat.(uint64)
-		if ok {
-			info.ChainID = chID
-		}
-	}
 	info.Latency = pstore.LatencyEWMA(id)
 	if connMgr != nil {
 		info.Protected = connMgr.IsProtected(id, "")
@@ -167,9 +151,7 @@ func dumpPeer(id peer.ID, nw network.Network, pstore peerstore.Peerstore, connMg
 }
 
 // Peers lists information of peers. Optionally filter to only retrieve connected peers.
-func (s *APIBackend) Peers(ctx context.Context, connected bool) (*PeerDump, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_peers")
-	defer recordDur()
+func (s *APIBackend) Peers(ctx context.Context, connected bool) (*apis.PeerDump, error) {
 	h := s.node.Host()
 	nw := h.Network()
 	pstore := h.Peerstore()
@@ -180,7 +162,7 @@ func (s *APIBackend) Peers(ctx context.Context, connected bool) (*PeerDump, erro
 		peers = pstore.Peers()
 	}
 
-	dump := &PeerDump{Peers: make(map[string]*PeerInfo)}
+	dump := &apis.PeerDump{Peers: make(map[string]*apis.PeerInfo)}
 	for _, id := range peers {
 		peerInfo, err := dumpPeer(id, nw, pstore, s.node.ConnectionManager())
 		if err != nil {
@@ -207,27 +189,18 @@ func (s *APIBackend) Peers(ctx context.Context, connected bool) (*PeerDump, erro
 	return dump, nil
 }
 
-type PeerStats struct {
-	Connected     uint `json:"connected"`
-	Table         uint `json:"table"`
-	BlocksTopic   uint `json:"blocksTopic"`
-	BlocksTopicV2 uint `json:"blocksTopicV2"`
-	Banned        uint `json:"banned"`
-	Known         uint `json:"known"`
-}
-
-func (s *APIBackend) PeerStats(_ context.Context) (*PeerStats, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_peerStats")
-	defer recordDur()
+func (s *APIBackend) PeerStats(_ context.Context) (*apis.PeerStats, error) {
 	h := s.node.Host()
 	nw := h.Network()
 	pstore := h.Peerstore()
 
-	stats := &PeerStats{
+	stats := &apis.PeerStats{
 		Connected:     uint(len(nw.Peers())),
 		Table:         0,
 		BlocksTopic:   uint(len(s.node.GossipOut().BlocksTopicV1Peers())),
 		BlocksTopicV2: uint(len(s.node.GossipOut().BlocksTopicV2Peers())),
+		BlocksTopicV3: uint(len(s.node.GossipOut().BlocksTopicV3Peers())),
+		BlocksTopicV4: uint(len(s.node.GossipOut().BlocksTopicV4Peers())),
 		Banned:        0,
 		Known:         uint(len(pstore.Peers())),
 	}
@@ -241,8 +214,6 @@ func (s *APIBackend) PeerStats(_ context.Context) (*PeerStats, error) {
 }
 
 func (s *APIBackend) DiscoveryTable(_ context.Context) ([]*enode.Node, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_discoveryTable")
-	defer recordDur()
 	if dv5 := s.node.Dv5Udp(); dv5 != nil {
 		return dv5.AllNodes(), nil
 	} else {
@@ -250,29 +221,31 @@ func (s *APIBackend) DiscoveryTable(_ context.Context) ([]*enode.Node, error) {
 	}
 }
 
-func (s *APIBackend) BlockPeer(_ context.Context, p peer.ID) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_blockPeer")
-	defer recordDur()
+func (s *APIBackend) BlockPeer(_ context.Context, id peer.ID) error {
+	if err := id.Validate(); err != nil {
+		s.log.Warn("invalid peer ID", "method", "BlockPeer", "peer", id, "err", err)
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
-		return gater.BlockPeer(p)
+		return gater.BlockPeer(id)
 	}
 }
 
-func (s *APIBackend) UnblockPeer(_ context.Context, p peer.ID) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockPeer")
-	defer recordDur()
+func (s *APIBackend) UnblockPeer(_ context.Context, id peer.ID) error {
+	if err := id.Validate(); err != nil {
+		s.log.Warn("invalid peer ID", "method", "UnblockPeer", "peer", id, "err", err)
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
-		return gater.UnblockPeer(p)
+		return gater.UnblockPeer(id)
 	}
 }
 
 func (s *APIBackend) ListBlockedPeers(_ context.Context) ([]peer.ID, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedPeers")
-	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return nil, ErrNoConnectionGater
 	} else {
@@ -283,8 +256,10 @@ func (s *APIBackend) ListBlockedPeers(_ context.Context) ([]peer.ID, error) {
 // BlockAddr adds an IP address to the set of blocked addresses.
 // Note: active connections to the IP address are not automatically closed.
 func (s *APIBackend) BlockAddr(_ context.Context, ip net.IP) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_blockAddr")
-	defer recordDur()
+	if ip == nil {
+		s.log.Warn("invalid IP", "method", "BlockAddr")
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
@@ -293,8 +268,10 @@ func (s *APIBackend) BlockAddr(_ context.Context, ip net.IP) error {
 }
 
 func (s *APIBackend) UnblockAddr(_ context.Context, ip net.IP) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockAddr")
-	defer recordDur()
+	if ip == nil {
+		s.log.Warn("invalid IP", "method", "UnblockAddr")
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
@@ -303,8 +280,6 @@ func (s *APIBackend) UnblockAddr(_ context.Context, ip net.IP) error {
 }
 
 func (s *APIBackend) ListBlockedAddrs(_ context.Context) ([]net.IP, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedAddrs")
-	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return nil, ErrNoConnectionGater
 	} else {
@@ -315,8 +290,10 @@ func (s *APIBackend) ListBlockedAddrs(_ context.Context) ([]net.IP, error) {
 // BlockSubnet adds an IP subnet to the set of blocked addresses.
 // Note: active connections to the IP subnet are not automatically closed.
 func (s *APIBackend) BlockSubnet(_ context.Context, ipnet *net.IPNet) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_blockSubnet")
-	defer recordDur()
+	if ipnet == nil || ipnet.IP == nil || ipnet.Mask == nil {
+		s.log.Warn("invalid IPNet", "method", "BlockSubnet")
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
@@ -325,8 +302,10 @@ func (s *APIBackend) BlockSubnet(_ context.Context, ipnet *net.IPNet) error {
 }
 
 func (s *APIBackend) UnblockSubnet(_ context.Context, ipnet *net.IPNet) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_unblockSubnet")
-	defer recordDur()
+	if ipnet == nil || ipnet.IP == nil || ipnet.Mask == nil {
+		s.log.Warn("invalid IPNet", "method", "UnblockSubnet")
+		return ErrInvalidRequest
+	}
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return ErrNoConnectionGater
 	} else {
@@ -335,8 +314,6 @@ func (s *APIBackend) UnblockSubnet(_ context.Context, ipnet *net.IPNet) error {
 }
 
 func (s *APIBackend) ListBlockedSubnets(_ context.Context) ([]*net.IPNet, error) {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_listBlockedSubnets")
-	defer recordDur()
 	if gater := s.node.ConnectionGater(); gater == nil {
 		return nil, ErrNoConnectionGater
 	} else {
@@ -344,32 +321,34 @@ func (s *APIBackend) ListBlockedSubnets(_ context.Context) ([]*net.IPNet, error)
 	}
 }
 
-func (s *APIBackend) ProtectPeer(_ context.Context, p peer.ID) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_protectPeer")
-	defer recordDur()
+func (s *APIBackend) ProtectPeer(_ context.Context, id peer.ID) error {
+	if err := id.Validate(); err != nil {
+		s.log.Warn("invalid peer ID", "method", "ProtectPeer", "peer", id, "err", err)
+		return ErrInvalidRequest
+	}
 	if manager := s.node.ConnectionManager(); manager == nil {
 		return ErrNoConnectionManager
 	} else {
-		manager.Protect(p, "api-protected")
+		manager.Protect(id, "api-protected")
 		return nil
 	}
 }
 
-func (s *APIBackend) UnprotectPeer(_ context.Context, p peer.ID) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_unprotectPeer")
-	defer recordDur()
+func (s *APIBackend) UnprotectPeer(_ context.Context, id peer.ID) error {
+	if err := id.Validate(); err != nil {
+		s.log.Warn("invalid peer ID", "method", "UnprotectPeer", "peer", id, "err", err)
+		return ErrInvalidRequest
+	}
 	if manager := s.node.ConnectionManager(); manager == nil {
 		return ErrNoConnectionManager
 	} else {
-		manager.Unprotect(p, "api-protected")
+		manager.Unprotect(id, "api-protected")
 		return nil
 	}
 }
 
 // ConnectPeer connects to a given peer address, and wait for protocol negotiation & identification of the peer
 func (s *APIBackend) ConnectPeer(ctx context.Context, addr string) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_connectPeer")
-	defer recordDur()
 	h := s.node.Host()
 	addrInfo, err := peer.AddrInfoFromString(addr)
 	if err != nil {
@@ -382,7 +361,20 @@ func (s *APIBackend) ConnectPeer(ctx context.Context, addr string) error {
 }
 
 func (s *APIBackend) DisconnectPeer(_ context.Context, id peer.ID) error {
-	recordDur := s.m.RecordRPCServerRequest("opp2p_disconnectPeer")
-	defer recordDur()
-	return s.node.Host().Network().ClosePeer(id)
+	if err := id.Validate(); err != nil {
+		s.log.Warn("invalid peer ID", "method", "DisconnectPeer", "peer", id, "err", err)
+		return ErrInvalidRequest
+	}
+	err := s.node.Host().Network().ClosePeer(id)
+	if err != nil {
+		return err
+	}
+	ps := s.node.Host().Peerstore()
+	ps.RemovePeer(id)
+	ps.ClearAddrs(id)
+	err = s.node.ConnectionGater().UnblockPeer(id)
+	if err != nil {
+		return fmt.Errorf("closed peer but failed to unblock: %w", err)
+	}
+	return nil
 }

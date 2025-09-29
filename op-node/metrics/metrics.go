@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ethereum/go-ethereum/params"
-
+	altda "github.com/ethereum-optimism/optimism/op-alt-da"
 	"github.com/ethereum-optimism/optimism/op-node/p2p/store"
 	ophttp "github.com/ethereum-optimism/optimism/op-service/httputil"
 	"github.com/ethereum-optimism/optimism/op-service/metrics"
+	"github.com/ethereum/go-ethereum/params"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	libp2pmetrics "github.com/libp2p/go-libp2p/core/metrics"
@@ -22,32 +22,30 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/event"
 )
 
-const (
-	Namespace = "op_node"
-
-	BatchMethod = "<batch>"
-)
+const Namespace = "op_node"
 
 type Metricer interface {
 	RecordInfo(version string)
 	RecordUp()
-	RecordRPCServerRequest(method string) func()
-	RecordRPCClientRequest(method string) func(err error)
-	RecordRPCClientResponse(method string, err error)
 	SetDerivationIdle(status bool)
+	SetSequencerState(active bool)
 	RecordPipelineReset()
 	RecordSequencingError()
 	RecordPublishingError()
 	RecordDerivationError()
-	RecordReceivedUnsafePayload(payload *eth.ExecutionPayload)
+	RecordEmittedEvent(eventName string, emitter string)
+	RecordProcessedEvent(eventName string, deriver string, duration time.Duration)
+	RecordEventsRateLimited()
+	RecordReceivedUnsafePayload(payload *eth.ExecutionPayloadEnvelope)
 	RecordRef(layer string, name string, num uint64, timestamp uint64, h common.Hash)
 	RecordL1Ref(name string, ref eth.L1BlockRef)
 	RecordL2Ref(name string, ref eth.L2BlockRef)
 	RecordUnsafePayloadsBuffer(length uint64, memSize uint64, next eth.BlockID)
 	RecordDerivedBatches(batchType string)
-	CountSequencedTxs(count int)
+	CountSequencedTxsInBlock(txns int, deposits int)
 	RecordL1ReorgDepth(d uint64)
 	RecordSequencerInconsistentL1Origin(from eth.BlockID, to eth.BlockID)
 	RecordSequencerReset()
@@ -93,6 +91,9 @@ type Metrics struct {
 	DerivationErrors *metrics.Event
 	SequencingErrors *metrics.Event
 	PublishingErrors *metrics.Event
+	SequencerActive  prometheus.Gauge
+
+	*event.EventMetricsTracker
 
 	DerivedBatches metrics.EventVec
 
@@ -120,7 +121,9 @@ type Metrics struct {
 
 	L1ReorgDepth prometheus.Histogram
 
-	TransactionsSequencedTotal prometheus.Counter
+	TransactionsSequencedTotal *prometheus.CounterVec
+
+	AltDAMetrics altda.Metricer
 
 	// Channel Bank Metrics
 	headChannelOpenedEvent *metrics.Event
@@ -194,6 +197,12 @@ func NewMetrics(procName string) *Metrics {
 		DerivationErrors: metrics.NewEvent(factory, ns, "", "derivation_errors", "derivation errors"),
 		SequencingErrors: metrics.NewEvent(factory, ns, "", "sequencing_errors", "sequencing errors"),
 		PublishingErrors: metrics.NewEvent(factory, ns, "", "publishing_errors", "p2p publishing errors"),
+		SequencerActive: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "sequencer_active",
+			Help:      "1 if sequencer active, 0 otherwise",
+		}),
+		EventMetricsTracker: event.NewMetricsTracker(ns, factory),
 
 		DerivedBatches: metrics.NewEventVec(factory, ns, "", "derived_batches", "derived batches", []string{"type"}),
 
@@ -220,12 +229,11 @@ func NewMetrics(procName string) *Metrics {
 			Help:      "Histogram of L1 Reorg Depths",
 		}),
 
-		TransactionsSequencedTotal: factory.NewGauge(prometheus.GaugeOpts{
+		TransactionsSequencedTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns,
 			Name:      "transactions_sequenced_total",
 			Help:      "Count of total transactions sequenced",
-		}),
-
+		}, []string{"type"}),
 		PeerCount: factory.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns,
 			Subsystem: "p2p",
@@ -235,7 +243,7 @@ func NewMetrics(procName string) *Metrics {
 		PeerScores: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns,
 			Name:      "peer_scores",
-			Help:      "Histogram of currrently connected peer scores",
+			Help:      "Histogram of currently connected peer scores",
 			Buckets:   []float64{-100, -40, -20, -10, -5, -2, -1, -0.5, -0.05, 0, 0.05, 0.5, 1, 2, 5, 10, 20, 40},
 		}, []string{"type"}),
 		StreamCount: factory.NewGauge(prometheus.GaugeOpts{
@@ -384,6 +392,8 @@ func NewMetrics(procName string) *Metrics {
 			"required",
 		}),
 
+		AltDAMetrics: altda.MakeMetrics(ns, factory),
+
 		registry: registry,
 		factory:  factory,
 	}
@@ -415,7 +425,6 @@ func (m *Metrics) RecordInfo(version string) {
 
 // RecordUp sets the up metric to 1.
 func (m *Metrics) RecordUp() {
-	prometheus.MustRegister()
 	m.Up.Set(1)
 }
 
@@ -425,6 +434,14 @@ func (m *Metrics) SetDerivationIdle(status bool) {
 		val = 1
 	}
 	m.DerivationIdle.Set(val)
+}
+
+func (m *Metrics) SetSequencerState(active bool) {
+	var val float64
+	if active {
+		val = 1
+	}
+	m.SequencerActive.Set(val)
 }
 
 func (m *Metrics) RecordPipelineReset() {
@@ -443,9 +460,9 @@ func (m *Metrics) RecordDerivationError() {
 	m.DerivationErrors.Record()
 }
 
-func (m *Metrics) RecordReceivedUnsafePayload(payload *eth.ExecutionPayload) {
+func (m *Metrics) RecordReceivedUnsafePayload(payload *eth.ExecutionPayloadEnvelope) {
 	m.UnsafePayloads.Record()
-	m.RecordRef("l2", "received_payload", uint64(payload.BlockNumber), uint64(payload.Timestamp), payload.BlockHash)
+	m.RecordRef("l2", "received_payload", uint64(payload.ExecutionPayload.BlockNumber), uint64(payload.ExecutionPayload.Timestamp), payload.ExecutionPayload.BlockHash)
 }
 
 func (m *Metrics) RecordUnsafePayloadsBuffer(length uint64, memSize uint64, next eth.BlockID) {
@@ -458,8 +475,9 @@ func (m *Metrics) RecordDerivedBatches(batchType string) {
 	m.DerivedBatches.Record(batchType)
 }
 
-func (m *Metrics) CountSequencedTxs(count int) {
-	m.TransactionsSequencedTotal.Add(float64(count))
+func (m *Metrics) CountSequencedTxsInBlock(txns int, deposits int) {
+	m.TransactionsSequencedTotal.WithLabelValues("deposits").Add(float64(deposits))
+	m.TransactionsSequencedTotal.WithLabelValues("txns").Add(float64(txns - deposits))
 }
 
 func (m *Metrics) RecordL1ReorgDepth(d uint64) {
@@ -615,6 +633,7 @@ func (m *Metrics) ReportProtocolVersions(local, engine, recommended, required pa
 
 type noopMetricer struct {
 	metrics.NoopRPCMetrics
+	event.NoopMetrics
 }
 
 var NoopMetrics Metricer = new(noopMetricer)
@@ -626,6 +645,9 @@ func (n *noopMetricer) RecordUp() {
 }
 
 func (n *noopMetricer) SetDerivationIdle(status bool) {
+}
+
+func (m *noopMetricer) SetSequencerState(active bool) {
 }
 
 func (n *noopMetricer) RecordPipelineReset() {
@@ -640,7 +662,7 @@ func (n *noopMetricer) RecordPublishingError() {
 func (n *noopMetricer) RecordDerivationError() {
 }
 
-func (n *noopMetricer) RecordReceivedUnsafePayload(payload *eth.ExecutionPayload) {
+func (n *noopMetricer) RecordReceivedUnsafePayload(payload *eth.ExecutionPayloadEnvelope) {
 }
 
 func (n *noopMetricer) RecordRef(layer string, name string, num uint64, timestamp uint64, h common.Hash) {
@@ -658,7 +680,7 @@ func (n *noopMetricer) RecordUnsafePayloadsBuffer(length uint64, memSize uint64,
 func (n *noopMetricer) RecordDerivedBatches(batchType string) {
 }
 
-func (n *noopMetricer) CountSequencedTxs(count int) {
+func (n *noopMetricer) CountSequencedTxsInBlock(txns int, deposits int) {
 }
 
 func (n *noopMetricer) RecordL1ReorgDepth(d uint64) {

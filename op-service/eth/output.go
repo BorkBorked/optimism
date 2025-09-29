@@ -16,6 +16,11 @@ type OutputResponse struct {
 	Status                *SyncStatus `json:"syncStatus"`
 }
 
+type SafeHeadResponse struct {
+	L1Block  BlockID `json:"l1Block"`
+	SafeHead BlockID `json:"safeHead"`
+}
+
 var (
 	ErrInvalidOutput        = errors.New("invalid output")
 	ErrInvalidOutputVersion = errors.New("invalid output version")
@@ -32,9 +37,9 @@ type Output interface {
 }
 
 type OutputV0 struct {
-	StateRoot                Bytes32
-	MessagePasserStorageRoot Bytes32
-	BlockHash                common.Hash
+	StateRoot                Bytes32     `json:"stateRoot"`
+	MessagePasserStorageRoot Bytes32     `json:"messagePasserStorageRoot"`
+	BlockHash                common.Hash `json:"blockHash"`
 }
 
 func (o *OutputV0) Version() Bytes32 {

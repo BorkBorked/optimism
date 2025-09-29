@@ -1,36 +1,54 @@
 package batcher_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/ethereum-optimism/optimism/op-batcher/batcher"
+	"github.com/ethereum-optimism/optimism/op-batcher/compressor"
+	"github.com/ethereum-optimism/optimism/op-batcher/flags"
+	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-service/log"
 	"github.com/ethereum-optimism/optimism/op-service/metrics"
-	"github.com/ethereum-optimism/optimism/op-service/pprof"
+	"github.com/ethereum-optimism/optimism/op-service/oppprof"
 	"github.com/ethereum-optimism/optimism/op-service/rpc"
 	"github.com/ethereum-optimism/optimism/op-service/txmgr"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/stretchr/testify/require"
 )
 
 func validBatcherConfig() batcher.CLIConfig {
 	return batcher.CLIConfig{
 		L1EthRpc:               "fake",
-		L2EthRpc:               "fake",
-		RollupRpc:              "fake",
+		L2EthRpc:               []string{"fake"},
+		RollupRpc:              []string{"fake"},
 		MaxChannelDuration:     0,
 		SubSafetyMargin:        0,
 		PollInterval:           time.Second,
 		MaxPendingTransactions: 0,
 		MaxL1TxSize:            10,
+		TargetNumFrames:        1,
+		Compressor:             "shadow",
 		Stopped:                false,
 		BatchType:              0,
+		DataAvailabilityType:   flags.CalldataType,
 		TxMgrConfig:            txmgr.NewCLIConfig("fake", txmgr.DefaultBatcherFlagValues),
 		LogConfig:              log.DefaultCLIConfig(),
 		MetricsConfig:          metrics.DefaultCLIConfig(),
-		PprofConfig:            pprof.DefaultCLIConfig(),
+		PprofConfig:            oppprof.DefaultCLIConfig(),
 		// The compressor config is not checked in config.Check()
-		RPC: rpc.DefaultCLIConfig(),
+		RPC:             rpc.DefaultCLIConfig(),
+		CompressionAlgo: derive.Zlib,
+		ThrottleConfig: batcher.ThrottleConfig{
+			ControllerType:      flags.DefaultThrottleControllerType,
+			LowerThreshold:      flags.DefaultThrottleLowerThreshold,
+			UpperThreshold:      flags.DefaultThrottleUpperThreshold,
+			TxSizeLowerLimit:    flags.DefaultThrottleTxSizeLowerLimit,
+			TxSizeUpperLimit:    flags.DefaultThrottleTxSizeUpperLimit,
+			BlockSizeLowerLimit: flags.DefaultThrottleBlockSizeLowerLimit,
+			BlockSizeUpperLimit: flags.DefaultThrottleBlockSizeUpperLimit,
+		},
 	}
 }
 
@@ -38,6 +56,9 @@ func TestValidBatcherConfig(t *testing.T) {
 	cfg := validBatcherConfig()
 	require.NoError(t, cfg.Check(), "valid config should pass the check function")
 }
+
+// Set current
+var maxBlobsPerBlock = params.DefaultPragueBlobConfig.Max
 
 func TestBatcherConfig(t *testing.T) {
 	tests := []struct {
@@ -52,12 +73,12 @@ func TestBatcherConfig(t *testing.T) {
 		},
 		{
 			name:      "empty L2",
-			override:  func(c *batcher.CLIConfig) { c.L2EthRpc = "" },
+			override:  func(c *batcher.CLIConfig) { c.L2EthRpc = []string{} },
 			errString: "empty L2 RPC URL",
 		},
 		{
 			name:      "empty rollup",
-			override:  func(c *batcher.CLIConfig) { c.RollupRpc = "" },
+			override:  func(c *batcher.CLIConfig) { c.RollupRpc = []string{} },
 			errString: "empty rollup RPC URL",
 		},
 		{
@@ -68,7 +89,7 @@ func TestBatcherConfig(t *testing.T) {
 		{
 			name:      "max L1 tx size too small",
 			override:  func(c *batcher.CLIConfig) { c.MaxL1TxSize = 0 },
-			errString: "MaxL1TxSize must be greater than 0",
+			errString: "MaxL1TxSize must be greater than 1",
 		},
 		{
 			name:      "invalid batch type close",
@@ -79,6 +100,50 @@ func TestBatcherConfig(t *testing.T) {
 			name:      "invalid batch type far",
 			override:  func(c *batcher.CLIConfig) { c.BatchType = 100 },
 			errString: "unknown batch type: 100",
+		},
+		{
+			name:      "invalid batch submission policy",
+			override:  func(c *batcher.CLIConfig) { c.DataAvailabilityType = "foo" },
+			errString: "unknown data availability type: \"foo\"",
+		},
+		{
+			name:      "zero TargetNumFrames",
+			override:  func(c *batcher.CLIConfig) { c.TargetNumFrames = 0 },
+			errString: "TargetNumFrames must be at least 1",
+		},
+		{
+			name: fmt.Sprintf("larger %d TargetNumFrames for blobs", maxBlobsPerBlock),
+			override: func(c *batcher.CLIConfig) {
+				c.TargetNumFrames = maxBlobsPerBlock + 1
+				c.DataAvailabilityType = flags.BlobsType
+			},
+			errString: fmt.Sprintf("too many frames for blob transactions, max %d", maxBlobsPerBlock),
+		},
+		{
+			name: "invalid compr ratio for ratio compressor",
+			override: func(c *batcher.CLIConfig) {
+				c.ApproxComprRatio = 4.2
+				c.Compressor = compressor.RatioKind
+			},
+			errString: "invalid ApproxComprRatio 4.2 for ratio compressor",
+		},
+		{
+			name: "throttle_max_threshold=throttle_threshold",
+			override: func(c *batcher.CLIConfig) {
+				c.ThrottleConfig.LowerThreshold = 5
+				c.ThrottleConfig.UpperThreshold = 5
+
+			},
+			errString: "throttle.upper-threshold must be greater than throttle.lower-threshold",
+		},
+		{
+			name: "throttle_max_threshold=throttle_threshold",
+			override: func(c *batcher.CLIConfig) {
+				c.ThrottleConfig.LowerThreshold = 5
+				c.ThrottleConfig.UpperThreshold = 4
+
+			},
+			errString: "throttle.upper-threshold must be greater than throttle.lower-threshold",
 		},
 	}
 

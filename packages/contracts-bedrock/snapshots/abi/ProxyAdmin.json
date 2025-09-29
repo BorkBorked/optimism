@@ -11,30 +11,11 @@
     "type": "constructor"
   },
   {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "address",
-        "name": "previousOwner",
-        "type": "address"
-      },
-      {
-        "indexed": true,
-        "internalType": "address",
-        "name": "newOwner",
-        "type": "address"
-      }
-    ],
-    "name": "OwnershipTransferred",
-    "type": "event"
-  },
-  {
     "inputs": [],
     "name": "addressManager",
     "outputs": [
       {
-        "internalType": "contract AddressManager",
+        "internalType": "contract IAddressManager",
         "name": "",
         "type": "address"
       }
@@ -190,7 +171,7 @@
   {
     "inputs": [
       {
-        "internalType": "contract AddressManager",
+        "internalType": "contract IAddressManager",
         "name": "_address",
         "type": "address"
       }
@@ -302,5 +283,24 @@
     "outputs": [],
     "stateMutability": "payable",
     "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "previousOwner",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "newOwner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnershipTransferred",
+    "type": "event"
   }
 ]

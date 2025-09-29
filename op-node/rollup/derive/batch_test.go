@@ -6,12 +6,11 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
@@ -35,19 +34,21 @@ func RandomRawSpanBatch(rng *rand.Rand, chainId *big.Int) *RawSpanBatch {
 		blockTxCounts = append(blockTxCounts, blockTxCount)
 		totalblockTxCounts += blockTxCount
 	}
-	londonSigner := types.NewLondonSigner(chainId)
+	signer := types.NewIsthmusSigner(chainId)
 	var txs [][]byte
 	for i := 0; i < int(totalblockTxCounts); i++ {
 		var tx *types.Transaction
-		switch i % 4 {
+		switch i % 5 {
 		case 0:
 			tx = testutils.RandomLegacyTx(rng, types.HomesteadSigner{})
 		case 1:
-			tx = testutils.RandomLegacyTx(rng, londonSigner)
+			tx = testutils.RandomLegacyTx(rng, signer)
 		case 2:
-			tx = testutils.RandomAccessListTx(rng, londonSigner)
+			tx = testutils.RandomAccessListTx(rng, signer)
 		case 3:
-			tx = testutils.RandomDynamicFeeTx(rng, londonSigner)
+			tx = testutils.RandomDynamicFeeTx(rng, signer)
+		case 4:
+			tx = testutils.RandomSetCodeTx(rng, signer)
 		}
 		rawTx, err := tx.MarshalBinary()
 		if err != nil {
@@ -74,28 +75,6 @@ func RandomRawSpanBatch(rng *rand.Rand, chainId *big.Int) *RawSpanBatch {
 		},
 	}
 	return &rawSpanBatch
-}
-
-func RandomSingularBatch(rng *rand.Rand, txCount int, chainID *big.Int) *SingularBatch {
-	signer := types.NewLondonSigner(chainID)
-	baseFee := big.NewInt(rng.Int63n(300_000_000_000))
-	txsEncoded := make([]hexutil.Bytes, 0, txCount)
-	// force each tx to have equal chainID
-	for i := 0; i < txCount; i++ {
-		tx := testutils.RandomTx(rng, baseFee, signer)
-		txEncoded, err := tx.MarshalBinary()
-		if err != nil {
-			panic("tx Marshal binary" + err.Error())
-		}
-		txsEncoded = append(txsEncoded, hexutil.Bytes(txEncoded))
-	}
-	return &SingularBatch{
-		ParentHash:   testutils.RandomHash(rng),
-		EpochNum:     rollup.Epoch(1 + rng.Int63n(100_000_000)),
-		EpochHash:    testutils.RandomHash(rng),
-		Timestamp:    uint64(rng.Int63n(2_000_000_000)),
-		Transactions: txsEncoded,
-	}
 }
 
 func RandomValidConsecutiveSingularBatches(rng *rand.Rand, chainID *big.Int) []*SingularBatch {

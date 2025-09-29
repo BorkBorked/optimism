@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/mattn/go-isatty"
@@ -13,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 
 	opservice "github.com/ethereum-optimism/optimism/op-service"
+	oplog "github.com/ethereum-optimism/optimism/op-service/log"
 )
 
 const EnvPrefix = "OP_CHAIN_OPS_PROTOCOL_VERSION"
@@ -51,7 +53,8 @@ var (
 )
 
 func main() {
-	log.Root().SetHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(isatty.IsTerminal(os.Stderr.Fd()))))
+	color := isatty.IsTerminal(os.Stderr.Fd())
+	oplog.SetGlobalLogHandler(log.NewTerminalHandlerWithLevel(os.Stdout, slog.LevelDebug, color))
 
 	app := &cli.App{
 		Name:   "protocol-version",

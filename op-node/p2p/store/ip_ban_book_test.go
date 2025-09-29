@@ -18,7 +18,7 @@ func TestGetUnknownIPBan(t *testing.T) {
 	book := createMemoryIPBanBook(t)
 	defer book.Close()
 	exp, err := book.GetIPBanExpiration(net.IPv4(1, 2, 3, 4))
-	require.Same(t, UnknownBanErr, err)
+	require.Same(t, ErrUnknownBan, err)
 	require.Equal(t, time.Time{}, exp)
 }
 
@@ -35,7 +35,7 @@ func TestRoundTripIPBan(t *testing.T) {
 
 func createMemoryIPBanBook(t *testing.T) *ipBanBook {
 	store := sync.MutexWrap(ds.NewMapDatastore())
-	logger := testlog.Logger(t, log.LvlInfo)
+	logger := testlog.Logger(t, log.LevelInfo)
 	c := clock.NewDeterministicClock(time.UnixMilli(100))
 	book, err := newIPBanBook(context.Background(), logger, c, store)
 	require.NoError(t, err)

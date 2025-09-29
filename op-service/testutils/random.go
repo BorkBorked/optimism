@@ -6,12 +6,15 @@ import (
 	"math/big"
 	"math/rand"
 
+	"github.com/consensys/gnark-crypto/ecc/bls12-381/fr"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/holiman/uint256"
 )
 
 func RandomBool(rng *rand.Rand) bool {
@@ -106,7 +109,7 @@ func NextRandomL2Ref(rng *rand.Rand, l2BlockTime uint64, parent eth.L2BlockRef, 
 // Output is deterministic when the supplied rng generates the same random sequence.
 func InsecureRandomKey(rng *rand.Rand) *ecdsa.PrivateKey {
 	idx := rng.Intn(len(randomEcdsaKeys))
-	key, err := crypto.ToECDSA(common.Hex2Bytes(randomEcdsaKeys[idx]))
+	key, err := crypto.ToECDSA(common.FromHex(randomEcdsaKeys[idx]))
 	if err != nil {
 		// Should never happen because the list of keys is hard coded and known to be valid.
 		panic(fmt.Errorf("invalid pre-generated ecdsa key at index %v: %w", idx, err))
@@ -140,8 +143,16 @@ func RandomTo(rng *rand.Rand) *common.Address {
 	return &to
 }
 
+func isIsthmusSigner(signer types.Signer) bool {
+	isthusSigner := types.NewIsthmusSigner(signer.ChainID())
+	return signer.Equal(isthusSigner)
+}
+
 func RandomTx(rng *rand.Rand, baseFee *big.Int, signer types.Signer) *types.Transaction {
 	txTypeList := []int{types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType}
+	if isIsthmusSigner(signer) {
+		txTypeList = append(txTypeList, types.SetCodeTxType)
+	}
 	txType := txTypeList[rng.Intn(len(txTypeList))]
 	var tx *types.Transaction
 	switch txType {
@@ -151,6 +162,8 @@ func RandomTx(rng *rand.Rand, baseFee *big.Int, signer types.Signer) *types.Tran
 		tx = RandomAccessListTx(rng, signer)
 	case types.DynamicFeeTxType:
 		tx = RandomDynamicFeeTxWithBaseFee(rng, baseFee, signer)
+	case types.SetCodeTxType:
+		tx = RandomSetCodeTx(rng, signer)
 	default:
 		panic("invalid tx type")
 	}
@@ -169,7 +182,7 @@ func RandomLegacyTx(rng *rand.Rand, signer types.Signer) *types.Transaction {
 		Gas:      params.TxGas + uint64(rng.Int63n(2_000_000)),
 		To:       RandomTo(rng),
 		Value:    RandomETH(rng, 10),
-		Data:     RandomData(rng, rng.Intn(1000)),
+		Data:     RandomData(rng, rng.Intn(RandomDataSize)),
 	}
 	tx, err := types.SignNewTx(key, signer, txData)
 	if err != nil {
@@ -187,7 +200,7 @@ func RandomAccessListTx(rng *rand.Rand, signer types.Signer) *types.Transaction 
 		Gas:        params.TxGas + uint64(rng.Int63n(2_000_000)),
 		To:         RandomTo(rng),
 		Value:      RandomETH(rng, 10),
-		Data:       RandomData(rng, rng.Intn(1000)),
+		Data:       RandomData(rng, rng.Intn(RandomDataSize)),
 		AccessList: nil,
 	}
 	tx, err := types.SignNewTx(key, signer, txData)
@@ -195,6 +208,21 @@ func RandomAccessListTx(rng *rand.Rand, signer types.Signer) *types.Transaction 
 		panic(err)
 	}
 	return tx
+}
+
+func RandomAccessList(rng *rand.Rand) types.AccessList {
+	accessList := []types.AccessTuple{}
+	for range 1 + rng.Intn(3) {
+		storageKeys := []common.Hash{}
+		for range 1 + rng.Intn(4) {
+			storageKeys = append(storageKeys, RandomHash(rng))
+		}
+		accessList = append(accessList, types.AccessTuple{
+			Address:     RandomAddress(rng),
+			StorageKeys: storageKeys,
+		})
+	}
+	return accessList
 }
 
 func RandomDynamicFeeTxWithBaseFee(rng *rand.Rand, baseFee *big.Int, signer types.Signer) *types.Transaction {
@@ -208,7 +236,7 @@ func RandomDynamicFeeTxWithBaseFee(rng *rand.Rand, baseFee *big.Int, signer type
 		Gas:        params.TxGas + uint64(rng.Int63n(2_000_000)),
 		To:         RandomTo(rng),
 		Value:      RandomETH(rng, 10),
-		Data:       RandomData(rng, rng.Intn(1000)),
+		Data:       RandomData(rng, rng.Intn(RandomDataSize)),
 		AccessList: nil,
 	}
 	tx, err := types.SignNewTx(key, signer, txData)
@@ -218,9 +246,54 @@ func RandomDynamicFeeTxWithBaseFee(rng *rand.Rand, baseFee *big.Int, signer type
 	return tx
 }
 
+var RandomDataSize = 1000
+
 func RandomDynamicFeeTx(rng *rand.Rand, signer types.Signer) *types.Transaction {
 	baseFee := new(big.Int).SetUint64(rng.Uint64())
 	return RandomDynamicFeeTxWithBaseFee(rng, baseFee, signer)
+}
+
+func RandomSetCodeAuth(rng *rand.Rand) types.SetCodeAuthorization {
+	key := InsecureRandomKey(rng)
+
+	auth := types.SetCodeAuthorization{
+		ChainID: *uint256.MustFromHex("0x0"),
+		Address: RandomAddress(rng),
+		Nonce:   rng.Uint64(),
+	}
+
+	authSigned, err := types.SignSetCode(key, auth)
+	if err != nil {
+		panic(err)
+	}
+
+	return authSigned
+}
+
+func RandomSetCodeTx(rng *rand.Rand, signer types.Signer) *types.Transaction {
+	baseFee := new(big.Int).SetUint64(rng.Uint64())
+	key := InsecureRandomKey(rng)
+	tip := big.NewInt(rng.Int63n(10 * params.GWei))
+	to := RandomAddress(rng)
+	txData := &types.SetCodeTx{
+		ChainID:    uint256.MustFromBig(signer.ChainID()),
+		Nonce:      rng.Uint64(),
+		GasTipCap:  uint256.MustFromBig(tip),
+		GasFeeCap:  uint256.MustFromBig(new(big.Int).Add(baseFee, tip)),
+		Gas:        params.TxGas + uint64(rng.Int63n(2_000_000)),
+		To:         to,
+		Value:      uint256.MustFromBig(RandomETH(rng, 10)),
+		Data:       RandomData(rng, rng.Intn(RandomDataSize)),
+		AccessList: nil,
+		AuthList: []types.SetCodeAuthorization{
+			RandomSetCodeAuth(rng),
+		},
+	}
+	tx, err := types.SignNewTx(key, signer, txData)
+	if err != nil {
+		panic(err)
+	}
+	return tx
 }
 
 func RandomReceipt(rng *rand.Rand, signer types.Signer, tx *types.Transaction, txIndex uint64, cumulativeGasUsed uint64) *types.Receipt {
@@ -250,7 +323,7 @@ func RandomReceipt(rng *rand.Rand, signer types.Signer, tx *types.Transaction, t
 	}
 }
 
-func RandomHeader(rng *rand.Rand) *types.Header {
+func RandomHeaderWithTime(rng *rand.Rand, t uint64) *types.Header {
 	return &types.Header{
 		ParentHash:  RandomHash(rng),
 		UncleHash:   types.EmptyUncleHash,
@@ -263,7 +336,7 @@ func RandomHeader(rng *rand.Rand) *types.Header {
 		Number:      big.NewInt(1 + rng.Int63n(100_000_000)),
 		GasLimit:    0,
 		GasUsed:     0,
-		Time:        uint64(rng.Int63n(2_000_000_000)),
+		Time:        t,
 		Extra:       RandomData(rng, rng.Intn(33)),
 		MixDigest:   common.Hash{},
 		Nonce:       types.BlockNonce{},
@@ -271,16 +344,23 @@ func RandomHeader(rng *rand.Rand) *types.Header {
 	}
 }
 
+func RandomHeader(rng *rand.Rand) *types.Header {
+	t := uint64(rng.Int63n(2_000_000_000))
+	return RandomHeaderWithTime(rng, t)
+}
+
 func RandomBlock(rng *rand.Rand, txCount uint64) (*types.Block, []*types.Receipt) {
 	return RandomBlockPrependTxs(rng, int(txCount))
 }
 
-// RandomBlockPrependTxs returns a random block with txCount randomly generated
-// transactions and additionally the transactions ptxs prepended. So the total
-// number of transactions is len(ptxs) + txCount.
-func RandomBlockPrependTxs(rng *rand.Rand, txCount int, ptxs ...*types.Transaction) (*types.Block, []*types.Receipt) {
-	header := RandomHeader(rng)
-	signer := types.NewLondonSigner(big.NewInt(rng.Int63n(1000)))
+func RandomBlockPrependTxsWithTime(rng *rand.Rand, txCount int, t uint64, ptxs ...*types.Transaction) (*types.Block, []*types.Receipt) {
+	header := RandomHeaderWithTime(rng, t)
+	chainIDInt := rng.Int63n(1000)
+	if chainIDInt == 0 { // Zero chainID is invalid.
+		chainIDInt++
+	}
+	chainID := big.NewInt(chainIDInt)
+	signer := types.NewIsthmusSigner(chainID)
 	txs := make([]*types.Transaction, 0, txCount+len(ptxs))
 	txs = append(txs, ptxs...)
 	for i := 0; i < txCount; i++ {
@@ -295,7 +375,10 @@ func RandomBlockPrependTxs(rng *rand.Rand, txCount int, ptxs ...*types.Transacti
 	}
 	header.GasUsed = cumulativeGasUsed
 	header.GasLimit = cumulativeGasUsed + uint64(rng.Int63n(int64(cumulativeGasUsed)))
-	block := types.NewBlock(header, txs, nil, receipts, trie.NewStackTrie(nil))
+	body := types.Body{
+		Transactions: txs,
+	}
+	block := types.NewBlock(header, &body, receipts, trie.NewStackTrie(nil), types.DefaultBlockConfig)
 	logIndex := uint(0)
 	for i, r := range receipts {
 		r.BlockHash = block.Hash()
@@ -310,6 +393,30 @@ func RandomBlockPrependTxs(rng *rand.Rand, txCount int, ptxs ...*types.Transacti
 		}
 	}
 	return block, receipts
+}
+
+// RandomBlockPrependTxs returns a random block with txCount randomly generated
+// transactions and additionally the transactions ptxs prepended. So the total
+// number of transactions is len(ptxs) + txCount.
+func RandomBlockPrependTxs(rng *rand.Rand, txCount int, ptxs ...*types.Transaction) (*types.Block, []*types.Receipt) {
+	t := uint64(rng.Int63n(2_000_000_000))
+	return RandomBlockPrependTxsWithTime(rng, txCount, t, ptxs...)
+}
+
+func RandomBlob(rng *rand.Rand) (kzg4844.Blob, kzg4844.Commitment, error) {
+	var blob kzg4844.Blob
+	for i := 0; i < params.BlobTxFieldElementsPerBlob; i++ {
+		fieldEl := fr.NewElement(0)
+		randVal := new(big.Int).SetUint64(rng.Uint64())
+		fieldEl.SetBigInt(randVal)
+
+		fieldElBytes := fieldEl.Bytes()
+		copy(blob[i*32:(i+1)*32], fieldElBytes[:])
+	}
+
+	commitment, err := kzg4844.BlobToCommitment(&blob)
+
+	return blob, commitment, err
 }
 
 func RandomOutputResponse(rng *rand.Rand) *eth.OutputResponse {
@@ -329,7 +436,6 @@ func RandomOutputResponse(rng *rand.Rand) *eth.OutputResponse {
 			SafeL2:             RandomL2BlockRef(rng),
 			FinalizedL2:        RandomL2BlockRef(rng),
 			PendingSafeL2:      RandomL2BlockRef(rng),
-			EngineSyncTarget:   RandomL2BlockRef(rng),
 		},
 	}
 }
